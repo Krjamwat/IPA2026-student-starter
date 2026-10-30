@@ -1,2 +1,21 @@
 ---
-# TODO: implement the Ansible apply playbook for Part 3.
+# ==============================================================================
+# Ansible Playbook for Applying Loopback Interface
+# ทำไมต้องใช้ cisco.ios.ios_config และ defaults: true:
+# 1. parents: "interface {{ interface_name }}" ทำให้เข้าไปรันคำสั่งใน sub-mode ของ interface
+# 2. defaults: true สำคัญมาก: เนื่องจากคำสั่ง 'no shutdown' เป็นค่าเริ่มต้น (default) ของ IOS
+#    หากไม่ใส่ defaults: true ทาง Ansible จะมองไม่เห็นสถานะ no shutdown ใน running-config
+#    และจะพยายามส่งคำสั่งซ้ำทุกครั้ง การใส่ defaults: true จะทำให้การทำงานเป็น Idempotent
+# ==============================================================================
+- name: Apply Loopback Interface
+  hosts: routers
+  gather_facts: false
+  tasks:
+    - name: Configure interface with defaults enabled
+      cisco.ios.ios_config:
+        lines:
+          - "description {{ description }}"
+          - "ip address {{ ipv4_address }} {{ netmask }}"
+          - "{{ 'shutdown' if shutdown else 'no shutdown' }}"
+        parents: "interface {{ interface_name }}"
+        defaults: true
