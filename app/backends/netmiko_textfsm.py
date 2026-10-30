@@ -10,6 +10,7 @@
 import os
 from netmiko import ConnectHandler
 from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
+from netmiko.utilities import get_structured_data
 
 
 def _get_device(router):
@@ -20,7 +21,6 @@ def _get_device(router):
         "username": os.getenv("ROUTER_USER", "cisco"),
         "password": os.getenv("ROUTER_PASS", "cisco"),
         "conn_timeout": 10,
-        "read_timeout_override": 10,
     }
 
 
@@ -41,11 +41,22 @@ def get_interface_state(
             ip_info, descriptions = netmiko_get(router, interface_name)
         else:
             with ConnectHandler(**_get_device(router)) as conn:
-                ip_info = conn.send_command(f"show ip interface {interface_name}", use_textfsm=True)
-                descriptions = conn.send_command("show interfaces description", use_textfsm=True)
-                if isinstance(ip_info, str):
+                raw_ip = conn.send_command(f"show ip interface {interface_name}")
+                # หาก Router แจ้ง Invalid interface แสดงว่ายังไม่มี Interface นี้อยู่บน Router
+                if "invalid" in raw_ip.lower() or "not found" in raw_ip.lower() or "error" in raw_ip.lower():
                     ip_info = []
-                if isinstance(descriptions, str):
+                else:
+                    try:
+                        parsed = get_structured_data(raw_ip, command=f"show ip interface {interface_name}", platform="cisco_ios")
+                        ip_info = parsed if isinstance(parsed, list) else []
+                    except Exception:
+                        ip_info = []
+
+                raw_desc = conn.send_command("show interfaces description")
+                try:
+                    parsed_desc = get_structured_data(raw_desc, command="show interfaces description", platform="cisco_ios")
+                    descriptions = parsed_desc if isinstance(parsed_desc, list) else []
+                except Exception:
                     descriptions = []
     except (PermissionError, NetmikoAuthenticationException):
         return {"status": "error", "result": "authentication_failed"}
@@ -63,9 +74,14 @@ def get_interface_state(
     # ทำไม: ถ้าผลลัพธ์มีคำว่า "administratively down" แสดงว่าถูก shutdown -> admin_state: down
     admin_state = "down" if "admin" in link_status else "up"
 
-    ip_addr = ip_record["ip_address"][0]
-    prefix = ip_record["prefix_length"][0]
-    ipv4 = f"{ip_addr}/{prefix}"
+    ip_list = ip_record.get("ip_address")
+    prefix_list = ip_record.get("prefix_length")
+    if ip_list and prefix_list:
+        ip_addr = ip_list[0]
+        prefix = prefix_list[0]
+        ipv4 = f"{ip_addr}/{prefix}"
+    else:
+        ipv4 = None
 
     # ทำไมต้องแปลงชื่อย่อ Loopback123 เป็น Lo123:
     # คำสั่ง 'show interfaces description' ของ Cisco มักย่อชื่อพอร์ต เช่น Loopback123 -> Lo123
