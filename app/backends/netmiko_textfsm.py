@@ -7,6 +7,22 @@
 #   เพราะคำสั่ง "no interface Loopback..." ใน CLI มีความแน่นอนและเสถียรที่สุด
 # ==============================================================================
 
+import os
+from netmiko import ConnectHandler
+from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
+
+
+def _get_device(router):
+    """สร้าง device connection config สำหรับเชื่อมต่อไปยัง Cisco Router"""
+    return {
+        "device_type": "cisco_ios",
+        "host": router,
+        "username": os.getenv("ROUTER_USER", "cisco"),
+        "password": os.getenv("ROUTER_PASS", "cisco"),
+        "conn_timeout": 10,
+        "read_timeout_override": 10,
+    }
+
 
 def get_interface_state(
     router,
@@ -24,10 +40,16 @@ def get_interface_state(
         if netmiko_get is not None:
             ip_info, descriptions = netmiko_get(router, interface_name)
         else:
-            ip_info, descriptions = [], []
-    except PermissionError:
+            with ConnectHandler(**_get_device(router)) as conn:
+                ip_info = conn.send_command(f"show ip interface {interface_name}", use_textfsm=True)
+                descriptions = conn.send_command("show interfaces description", use_textfsm=True)
+                if isinstance(ip_info, str):
+                    ip_info = []
+                if isinstance(descriptions, str):
+                    descriptions = []
+    except (PermissionError, NetmikoAuthenticationException):
         return {"status": "error", "result": "authentication_failed"}
-    except ConnectionError:
+    except (ConnectionError, NetmikoTimeoutException, TimeoutError):
         return {"status": "error", "result": "connection_failed"}
     except Exception:
         return {"status": "error", "result": "backend_failed"}
@@ -79,20 +101,45 @@ def delete_interface(
     เพื่อให้การลบมีคุณสมบัติ Idempotency (ถ้า interface ถูกลบไปแล้ว สั่งลบซ้ำอีกครั้ง
     จะต้องไม่พัง และตอบกลับว่า not_found พร้อม interface: null เพื่อยืนยันว่าไม่มีอยู่แล้วจริง)
     """
-    try:
-        if netmiko_delete is not None:
+    # กรณี Unit Test (มี mock netmiko_delete ส่งเข้ามา)
+    if netmiko_delete is not None:
+        try:
             res = netmiko_delete(router, interface_name)
-        else:
-            res = "deleted"
-    except PermissionError:
+        except PermissionError:
+            return {"status": "error", "result": "authentication_failed"}
+        except ConnectionError:
+            return {"status": "error", "result": "connection_failed"}
+        except Exception:
+            return {"status": "error", "result": "backend_failed"}
+
+        if res == "not_found":
+            return {"status": "ok", "result": "not_found", "interface": None}
+        if res == "deleted":
+            return {"status": "ok", "result": "deleted"}
+        return {"status": "error", "result": "backend_failed"}
+
+    # กรณียิง Router จริง (Live Mode) ตาม Spec 324-329:
+    # 1. ตรวจก่อนว่า interface มีอยู่ไหม
+    status_resp = get_interface_state(router, interface_name)
+    if status_resp.get("status") == "error":
+        return status_resp
+    if status_resp.get("result") == "not_found":
+        return {"status": "ok", "result": "not_found", "interface": None}
+
+    # 2. ถ้ามีอยู่ ให้ส่งคำสั่ง no interface <name> เข้า Router จริง
+    try:
+        with ConnectHandler(**_get_device(router)) as conn:
+            conn.send_config_set([f"no interface {interface_name}"])
+    except (PermissionError, NetmikoAuthenticationException):
         return {"status": "error", "result": "authentication_failed"}
-    except ConnectionError:
+    except (ConnectionError, NetmikoTimeoutException, TimeoutError):
         return {"status": "error", "result": "connection_failed"}
     except Exception:
         return {"status": "error", "result": "backend_failed"}
 
-    if res == "not_found":
-        return {"status": "ok", "result": "not_found", "interface": None}
-    if res == "deleted":
+    # 3. ตรวจสอบยืนยันอีกครั้งว่าถูกลบไปแล้วจริง
+    verify_resp = get_interface_state(router, interface_name)
+    if verify_resp.get("result") == "not_found":
         return {"status": "ok", "result": "deleted"}
+
     return {"status": "error", "result": "backend_failed"}
